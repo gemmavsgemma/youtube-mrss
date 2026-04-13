@@ -1,0 +1,48 @@
+name: Generate MRSS Feeds
+
+on:
+  schedule:
+    # Runs daily at 06:00 UTC
+    - cron: '0 6 * * *'
+  workflow_dispatch: # Manual trigger from GitHub UI
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install google-api-python-client lxml
+
+      - name: Generate AVForums feed
+        env:
+          YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
+        run: |
+          python youtube_mrss.py \
+            --channel UCnOIS_Yb-gVJjzKlauXrf9w \
+            --output feeds/avforums.xml
+
+      # Add more channels here as needed:
+      # - name: Generate AnotherPub feed
+      #   env:
+      #     YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
+      #   run: |
+      #     python youtube_mrss.py \
+      #       --channel UC_THEIR_CHANNEL_ID \
+      #       --output feeds/anotherpub.xml
+
+      - name: Commit updated feeds
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add feeds/
+          git diff --staged --quiet || git commit -m "Update MRSS feeds — $(date -u +%Y-%m-%d)"
+          git push
