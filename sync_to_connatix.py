@@ -5,18 +5,28 @@ sync_to_connatix.py — Sync YouTube videos to Connatix via GitHub release stagi
 Downloads video from YouTube, uploads to a temporary GitHub release,
 passes the public URL to Connatix for encoding, then cleans up.
 
+The script determines "what's new" by querying the Connatix library directly,
+NOT by reading a local tracking file. Connatix is the source of truth — if
+a video is already in the library it's skipped, regardless of any local
+state. This makes the script idempotent against bulk imports, manual
+deletes, manual uploads via the Connatix dashboard, and tracking-file loss.
+
+A tracking file (synced_videos.json) is still WRITTEN for each sync — but
+purely as an audit log used by `--cleanup` to find GitHub release IDs to
+delete. It is NEVER read to decide what to sync.
+
 Usage:
     # Sync a single video (test mode):
     python sync_to_connatix.py --video-id 3Pv6aES9ruQ
 
-    # Sync all new videos from MRSS feed:
+    # Sync all new videos from MRSS feed (diffs against Connatix library):
     python sync_to_connatix.py --feed feeds/avforums.xml
 
     # Sync only videos listed in gaps file (uses feed for metadata):
     python sync_to_connatix.py --gaps gaps.txt --feed-for-gaps avforums.xml
 
     # Dry run (show what would be synced, don't upload):
-    python sync_to_connatix.py --gaps gaps.txt --feed-for-gaps avforums.xml --dry-run
+    python sync_to_connatix.py --feed feeds/avforums.xml --dry-run
 
     # Clean up GitHub releases after Connatix has encoded:
     python sync_to_connatix.py --cleanup
@@ -111,6 +121,91 @@ def get_account_id(jwt: str) -> str:
     if not items:
         raise ValueError(f"No active accounts found: {resp.text}")
     return items[0]["id"]
+
+
+# ---------------------------------------------------------------------------
+# Connatix library snapshot (source of truth for what's already synced)
+# ---------------------------------------------------------------------------
+
+
+def get_existing_connatix_youtube_ids(jwt: str, account_id: str) -> set:
+    """
+    Fetch every active media item in the Connatix library and return the set
+    of YouTube IDs derived from `sourceItemId`.
+
+    This replaces tracking-file based diff logic. The tracking file was a
+    cache of intent — what the script believed it had synced — and could
+    drift away from Connatix reality through manual uploads, manual deletes,
+    bulk imports, retried encodes, or anyone else editing the dashboard.
+
+    Connatix is the only source of truth that matters for "is this video
+    already in the library?", so we ask Connatix directly.
+
+    Returns a set of bare YouTube IDs (no `yt:` prefix — that's stripped to
+    match how the Worker's MRSS join normalises).
+    """
+    ids = set()
+    offset = 0
+    limit = 100
+
+    while True:
+        query = f"""
+        query {{
+            media {{
+                search(
+                    pagination: {{ offset: {offset}, limit: {limit} }},
+                    filtering: {{ state: ACTIVE, type: VIDEO }}
+                ) {{
+                    items {{
+                        sourceItemId
+                    }}
+                }}
+            }}
+        }}
+        """
+        resp = requests.post(
+            CONNATIX_GRAPHQL_URL,
+            data=query,
+            headers={
+                "Authorization": f"Bearer {jwt}",
+                "Content-Type": "application/graphql",
+                "AccountId": account_id,
+            },
+            timeout=60,
+        )
+        resp.raise_for_status()
+        result = resp.json()
+
+        if "errors" in result:
+            raise ValueError(f"GraphQL error during library fetch: {json.dumps(result['errors'])}")
+
+        items = result.get("data", {}).get("media", {}).get("search", {}).get("items", []) or []
+        if not items:
+            break
+
+        for item in items:
+            sid = (item.get("sourceItemId") or "").strip()
+            if not sid:
+                continue
+            # Strip the `yt:` prefix that some historical records carry
+            # (Samsung S99H and DALI SONIK 5 had this). Matches the Worker's
+            # MRSS join normalisation.
+            if sid.lower().startswith("yt:"):
+                sid = sid[3:]
+            # Defensive: only keep the 11-char YouTube ID shape so we don't
+            # accidentally pollute the set with stray non-YouTube sourceItemIds
+            if re.fullmatch(r"[a-zA-Z0-9_-]{11}", sid):
+                ids.add(sid)
+
+        # Stop if the page was short (last page) or we've hit a sanity ceiling
+        if len(items) < limit:
+            break
+        offset += limit
+        if offset > 20000:
+            print(f"  WARNING: library pagination hit safety ceiling at offset {offset}")
+            break
+
+    return ids
 
 
 # ---------------------------------------------------------------------------
@@ -568,10 +663,18 @@ def main():
             gap_ids = [line.strip() for line in f if line.strip()]
         print(f"Loaded {len(gap_ids)} video IDs from {args.gaps}")
 
-        # Check tracking for already-synced (resume support)
-        tracking = load_tracking(args.tracking_file)
-        gap_ids = [vid for vid in gap_ids if vid not in tracking]
-        print(f"  {len(gap_ids)} remaining after skipping already-synced")
+        # Filter against current Connatix library — anything already there
+        # gets skipped regardless of tracking-file state.
+        print("Fetching current Connatix library to filter already-synced gaps...")
+        try:
+            existing_ids = get_existing_connatix_youtube_ids(jwt, account_id)
+        except Exception as e:
+            print(f"Error: Could not fetch Connatix library: {e}", file=sys.stderr)
+            sys.exit(2)
+        print(f"  Connatix already has {len(existing_ids)} YouTube-sourced videos.")
+
+        gap_ids = [vid for vid in gap_ids if vid not in existing_ids]
+        print(f"  {len(gap_ids)} remaining after skipping already-in-Connatix")
 
         if not gap_ids:
             print("Nothing to sync — all gaps already filled.")
@@ -602,14 +705,40 @@ def main():
             print(f"  {len(videos) - yt_dlp_needed} videos matched in feed")
 
     else:
-        # Feed mode (original behaviour)
+        # Feed mode: diff MRSS feed against Connatix library directly.
+        # Replaces the old tracking-file diff which could drift out of sync
+        # with reality. Connatix is the source of truth — if it's in the
+        # library, we don't need to sync it; if it's not, we do.
         print(f"Parsing feed: {args.feed}")
         videos = parse_mrss_feed(args.feed)
         print(f"  Found {len(videos)} videos in feed.")
 
-        tracking = load_tracking(args.tracking_file)
-        new_videos = [v for v in videos if v["video_id"] not in tracking]
-        print(f"  {len(new_videos)} new videos to sync.")
+        print("Fetching current Connatix library to determine what's already synced...")
+        try:
+            existing_ids = get_existing_connatix_youtube_ids(jwt, account_id)
+        except Exception as e:
+            print(f"Error: Could not fetch Connatix library — refusing to sync without"
+                  f" a reliable baseline. Details: {e}", file=sys.stderr)
+            sys.exit(2)
+        print(f"  Connatix already has {len(existing_ids)} YouTube-sourced videos.")
+
+        new_videos = [v for v in videos if v["video_id"] not in existing_ids]
+        print(f"  {len(new_videos)} videos in feed not yet in Connatix.")
+
+        # Hard guard: if we're about to push more than 50 in a single run,
+        # something is wrong (library fetch returned partial, MRSS regenerated
+        # incorrectly, etc). Real daily deltas are 0–5 videos. Bail loudly
+        # rather than mass-upload duplicates.
+        if len(new_videos) > 50:
+            print(
+                f"\nABORT: {len(new_videos)} new videos exceeds safety ceiling of 50."
+                f" This usually means the Connatix library fetch returned partial"
+                f" data, or the MRSS feed has been regenerated against the wrong"
+                f" channel. Investigate before re-running.\n",
+                file=sys.stderr
+            )
+            sys.exit(3)
+
         videos = new_videos
 
     if not videos:

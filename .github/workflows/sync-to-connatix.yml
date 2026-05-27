@@ -1,12 +1,20 @@
 name: Sync YouTube to Connatix
 
 # Nightly sync of new AVForums YouTube uploads to Connatix.
-# Runs at 01:00 UTC so Connatix has 5h to finish encoding before the daily
-# MRSS regen at 06:00 UTC. Worker cron then picks up the joined data at the
-# next hourly tick (07:00 UTC onward).
 #
-# Manual triggering supported via workflow_dispatch, including a dry_run mode
-# for safe testing.
+# Runs at 01:00 UTC. Diffs the MRSS feed against the Connatix library (the
+# source of truth) and syncs anything in the feed that isn't already in
+# Connatix. Idempotent — running multiple times in a row syncs nothing the
+# second time round.
+#
+# Timing chain:
+#   01:00 UTC  this workflow syncs new videos -> Connatix encodes (~5-30 min)
+#   06:00 UTC  generate-mrss.yml regenerates avforums.xml
+#   07:00 UTC  Worker hourly cron picks up the new join state -> KV
+#              -> visible in gallery on next request
+#
+# Manual triggering supported via workflow_dispatch, including a dry_run
+# mode for safe testing.
 
 on:
   schedule:
@@ -22,14 +30,13 @@ on:
           - 'false'
           - 'true'
 
-# Permit the workflow to push synced_videos.json back to the repo and to
-# manage releases (needed for the GitHub-release staging pattern).
 permissions:
-  contents: write
+  contents: read   # No tracking-file writeback needed any more
+  # Releases are managed via the GITHUB_TOKEN's default repo perms which
+  # cover release create/delete on the repo where the workflow runs.
 
-# Prevent overlapping runs. If a previous run is still going (e.g. large
-# backlog), queue rather than cancel — sync is idempotent but mid-flight
-# release management could get tangled by concurrent edits.
+# Prevent overlapping runs. If a previous run is still going, queue rather
+# than cancel — release management could get tangled by concurrent edits.
 concurrency:
   group: sync-to-connatix
   cancel-in-progress: false
@@ -37,15 +44,11 @@ concurrency:
 jobs:
   sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 240  # 4h ceiling; typical run ~15 min, large backlogs ~1h
+    timeout-minutes: 240  # 4h ceiling; typical run ~3 min for 0–5 deltas
 
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
-        with:
-          # Default checkout uses GITHUB_TOKEN with limited push perms;
-          # explicit token here ensures the commit step at the end can push.
-          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -57,14 +60,15 @@ jobs:
           pip install requests lxml yt-dlp python-dotenv google-api-python-client
 
       - name: Upgrade yt-dlp to latest
-        # YouTube changes break older yt-dlp versions regularly. Always
-        # use the freshest release available at run time.
+        # YouTube changes break older yt-dlp versions regularly. Always use
+        # the freshest release available at run time.
         run: pip install --upgrade yt-dlp
 
-      - name: Generate fresh MRSS feed
+      - name: Regenerate MRSS feed in-memory
         # The 06:00 MRSS workflow commits feeds/avforums.xml daily. Here we
-        # regenerate in-memory at 01:00 so sync uses the absolute latest
-        # YouTube state, not yesterday's committed feed.
+        # regenerate at 01:00 so sync uses the absolute latest YouTube state,
+        # not yesterday's committed feed. No commit step — the 06:00 workflow
+        # is the canonical regenerator.
         env:
           YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
         run: |
@@ -87,14 +91,10 @@ jobs:
           fi
 
       - name: Clean up GitHub releases for synced videos
-        # Connatix has its own ingestion delay (typically 5-30 min). Running
-        # cleanup immediately after sync may delete the release before
-        # Connatix has finished pulling the file. The script's tracking marks
-        # videos as synced once Connatix accepts the URL, but encoding
-        # happens after. Risk-managed by GitHub's behaviour: deleting a
-        # release doesn't immediately invalidate already-downloaded URLs
-        # (they 404 only on subsequent requests). Connatix should have the
-        # file in hand by the time we get here.
+        # Releases were created during sync to stage video files for Connatix
+        # to pull. Once Connatix has them, the staging releases are dead
+        # weight. The script's tracking file records release IDs purely so
+        # this cleanup step can find them.
         if: success() && inputs.dry_run != 'true'
         env:
           CONNATIX_EMAIL: ${{ secrets.CONNATIX_EMAIL }}
@@ -103,17 +103,3 @@ jobs:
           GITHUB_REPO: ${{ github.repository }}
         run: |
           python sync_to_connatix.py --cleanup
-
-      - name: Commit tracking file
-        # Tracking file must be committed back to the repo so the next run
-        # knows what's already been synced. Without this, every run would
-        # re-attempt every video.
-        if: inputs.dry_run != 'true'
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add synced_videos.json
-          # Only commit if there are changes — avoids empty-commit churn
-          # on quiet days when no new videos appeared.
-          git diff --staged --quiet || git commit -m "Sync to Connatix — $(date -u +%Y-%m-%d)"
-          git push
